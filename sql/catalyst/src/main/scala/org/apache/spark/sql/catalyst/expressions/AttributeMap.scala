@@ -23,19 +23,21 @@ package org.apache.spark.sql.catalyst.expressions
  * of the name, or the expected nullability).
  */
 object AttributeMap {
-  def apply[A](kvs: Seq[(Attribute, A)]) =
-    new AttributeMap(kvs.map(kv => (kv._1.exprId, (kv._1, kv._2))).toMap)
+  def apply[A](kvs: Seq[(Attribute, A)]): AttributeMap[A] = {
+    new AttributeMap(kvs.map(kv => (kv._1.exprId, kv)).toMap)
+  }
 }
 
-class AttributeMap[A](baseMap: Map[ExprId, (Attribute, A)])
+class AttributeMap[A](val baseMap: Map[ExprId, (Attribute, A)])
   extends Map[Attribute, A] with Serializable {
 
   override def get(k: Attribute): Option[A] = baseMap.get(k.exprId).map(_._2)
 
-  override def + [B1 >: A](kv: (Attribute, B1)): Map[Attribute, B1] =
-    (baseMap.map(_._2) + kv).toMap
+  override def contains(k: Attribute): Boolean = get(k).isDefined
 
-  override def iterator: Iterator[(Attribute, A)] = baseMap.map(_._2).iterator
+  override def + [B1 >: A](kv: (Attribute, B1)): Map[Attribute, B1] = baseMap.values.toMap + kv
 
-  override def -(key: Attribute): Map[Attribute, A] = (baseMap.map(_._2) - key).toMap
+  override def iterator: Iterator[(Attribute, A)] = baseMap.valuesIterator
+
+  override def -(key: Attribute): Map[Attribute, A] = baseMap.values.toMap - key
 }

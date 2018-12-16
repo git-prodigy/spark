@@ -17,6 +17,9 @@ rem See the License for the specific language governing permissions and
 rem limitations under the License.
 rem
 
-set SPARK_HOME=%~dp0..
+rem This is the entry point for running Spark shell. To avoid polluting the
+rem environment, it just launches a new cmd to do the real work.
 
-cmd /V /E /C %SPARK_HOME%\bin\spark-submit.cmd --class org.apache.spark.repl.Main %* spark-shell
+rem The outermost quotes are used to prevent Windows command line parse error
+rem when there are some quotes in parameters, see SPARK-21877.
+cmd /V /E /C ""%~dp0spark-shell2.cmd" %*"

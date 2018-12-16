@@ -17,103 +17,151 @@
 
 package org.apache.spark.sql.execution
 
-import org.apache.spark.sql.catalyst.analysis.MultiInstanceRelation
-import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
-
-import scala.reflect.runtime.universe.TypeTag
-
-import org.apache.spark.annotation.DeveloperApi
 import org.apache.spark.rdd.RDD
-import org.apache.spark.sql.{SQLContext, Row}
-import org.apache.spark.sql.catalyst.ScalaReflection
-import org.apache.spark.sql.catalyst.expressions.{Attribute, GenericMutableRow}
+import org.apache.spark.sql.{Encoder, SparkSession}
+import org.apache.spark.sql.catalyst.InternalRow
+import org.apache.spark.sql.catalyst.analysis.MultiInstanceRelation
+import org.apache.spark.sql.catalyst.expressions._
+import org.apache.spark.sql.catalyst.plans.logical._
+import org.apache.spark.sql.catalyst.plans.physical.{Partitioning, UnknownPartitioning}
+import org.apache.spark.sql.catalyst.util.truncatedString
+import org.apache.spark.sql.execution.metric.SQLMetrics
 
-/**
- * :: DeveloperApi ::
- */
-@DeveloperApi
-object RDDConversions {
-  def productToRowRdd[A <: Product](data: RDD[A]): RDD[Row] = {
-    data.mapPartitions { iterator =>
-      if (iterator.isEmpty) {
-        Iterator.empty
-      } else {
-        val bufferedIterator = iterator.buffered
-        val mutableRow = new GenericMutableRow(bufferedIterator.head.productArity)
+object ExternalRDD {
 
-        bufferedIterator.map { r =>
-          var i = 0
-          while (i < mutableRow.length) {
-            mutableRow(i) = ScalaReflection.convertToCatalyst(r.productElement(i))
-            i += 1
-          }
+  def apply[T: Encoder](rdd: RDD[T], session: SparkSession): LogicalPlan = {
+    val externalRdd = ExternalRDD(CatalystSerde.generateObjAttr[T], rdd)(session)
+    CatalystSerde.serialize[T](externalRdd)
+  }
+}
 
-          mutableRow
-        }
+/** Logical plan node for scanning data from an RDD. */
+case class ExternalRDD[T](
+    outputObjAttr: Attribute,
+    rdd: RDD[T])(session: SparkSession)
+  extends LeafNode with ObjectProducer with MultiInstanceRelation {
+
+  override protected final def otherCopyArgs: Seq[AnyRef] = session :: Nil
+
+  override def newInstance(): ExternalRDD.this.type =
+    ExternalRDD(outputObjAttr.newInstance(), rdd)(session).asInstanceOf[this.type]
+
+  override protected def stringArgs: Iterator[Any] = Iterator(output)
+
+  override def computeStats(): Statistics = Statistics(
+    // TODO: Instead of returning a default value here, find a way to return a meaningful size
+    // estimate for RDDs. See PR 1238 for more discussions.
+    sizeInBytes = BigInt(session.sessionState.conf.defaultSizeInBytes)
+  )
+}
+
+/** Physical plan node for scanning data from an RDD. */
+case class ExternalRDDScanExec[T](
+    outputObjAttr: Attribute,
+    rdd: RDD[T]) extends LeafExecNode with ObjectProducerExec {
+
+  override lazy val metrics = Map(
+    "numOutputRows" -> SQLMetrics.createMetric(sparkContext, "number of output rows"))
+
+  private def rddName: String = Option(rdd.name).map(n => s" $n").getOrElse("")
+
+  override val nodeName: String = s"Scan$rddName"
+
+  protected override def doExecute(): RDD[InternalRow] = {
+    val numOutputRows = longMetric("numOutputRows")
+    val outputDataType = outputObjAttr.dataType
+    rdd.mapPartitionsInternal { iter =>
+      val outputObject = ObjectOperator.wrapObjectToRow(outputDataType)
+      iter.map { value =>
+        numOutputRows += 1
+        outputObject(value)
       }
     }
   }
 
-  /*
-  def toLogicalPlan[A <: Product : TypeTag](productRdd: RDD[A]): LogicalPlan = {
-    LogicalRDD(ScalaReflection.attributesFor[A], productToRowRdd(productRdd))
+  override def simpleString: String = {
+    s"$nodeName${output.mkString("[", ",", "]")}"
   }
-  */
 }
 
-case class LogicalRDD(output: Seq[Attribute], rdd: RDD[Row])(sqlContext: SQLContext)
-  extends LogicalPlan with MultiInstanceRelation {
+/** Logical plan node for scanning data from an RDD of InternalRow. */
+case class LogicalRDD(
+    output: Seq[Attribute],
+    rdd: RDD[InternalRow],
+    outputPartitioning: Partitioning = UnknownPartitioning(0),
+    override val outputOrdering: Seq[SortOrder] = Nil,
+    override val isStreaming: Boolean = false)(session: SparkSession)
+  extends LeafNode with MultiInstanceRelation {
 
-  def children = Nil
+  override protected final def otherCopyArgs: Seq[AnyRef] = session :: Nil
 
-  def newInstance() =
-    LogicalRDD(output.map(_.newInstance()), rdd)(sqlContext).asInstanceOf[this.type]
+  override def newInstance(): LogicalRDD.this.type = {
+    val rewrite = output.zip(output.map(_.newInstance())).toMap
 
-  override def sameResult(plan: LogicalPlan) = plan match {
-    case LogicalRDD(_, otherRDD) => rdd.id == otherRDD.id
-    case _ => false
+    val rewrittenPartitioning = outputPartitioning match {
+      case p: Expression =>
+        p.transform {
+          case e: Attribute => rewrite.getOrElse(e, e)
+        }.asInstanceOf[Partitioning]
+
+      case p => p
+    }
+
+    val rewrittenOrdering = outputOrdering.map(_.transform {
+      case e: Attribute => rewrite.getOrElse(e, e)
+    }.asInstanceOf[SortOrder])
+
+    LogicalRDD(
+      output.map(rewrite),
+      rdd,
+      rewrittenPartitioning,
+      rewrittenOrdering,
+      isStreaming
+    )(session).asInstanceOf[this.type]
   }
 
-  @transient override lazy val statistics = Statistics(
+  override protected def stringArgs: Iterator[Any] = Iterator(output, isStreaming)
+
+  override def computeStats(): Statistics = Statistics(
     // TODO: Instead of returning a default value here, find a way to return a meaningful size
     // estimate for RDDs. See PR 1238 for more discussions.
-    sizeInBytes = BigInt(sqlContext.defaultSizeInBytes)
+    sizeInBytes = BigInt(session.sessionState.conf.defaultSizeInBytes)
   )
 }
 
-case class PhysicalRDD(output: Seq[Attribute], rdd: RDD[Row]) extends LeafNode {
-  override def execute() = rdd
-}
+/** Physical plan node for scanning data from an RDD of InternalRow. */
+case class RDDScanExec(
+    output: Seq[Attribute],
+    rdd: RDD[InternalRow],
+    name: String,
+    override val outputPartitioning: Partitioning = UnknownPartitioning(0),
+    override val outputOrdering: Seq[SortOrder] = Nil) extends LeafExecNode with InputRDDCodegen {
 
-@deprecated("Use LogicalRDD", "1.2.0")
-case class ExistingRdd(output: Seq[Attribute], rdd: RDD[Row]) extends LeafNode {
-  override def execute() = rdd
-}
+  private def rddName: String = Option(rdd.name).map(n => s" $n").getOrElse("")
 
-@deprecated("Use LogicalRDD", "1.2.0")
-case class SparkLogicalPlan(alreadyPlanned: SparkPlan)(@transient sqlContext: SQLContext)
-  extends LogicalPlan with MultiInstanceRelation {
+  override val nodeName: String = s"Scan $name$rddName"
 
-  def output = alreadyPlanned.output
-  override def children = Nil
+  override lazy val metrics = Map(
+    "numOutputRows" -> SQLMetrics.createMetric(sparkContext, "number of output rows"))
 
-  override final def newInstance(): this.type = {
-    SparkLogicalPlan(
-      alreadyPlanned match {
-        case ExistingRdd(output, rdd) => ExistingRdd(output.map(_.newInstance), rdd)
-        case _ => sys.error("Multiple instance of the same relation detected.")
-      })(sqlContext).asInstanceOf[this.type]
+  protected override def doExecute(): RDD[InternalRow] = {
+    val numOutputRows = longMetric("numOutputRows")
+    rdd.mapPartitionsWithIndexInternal { (index, iter) =>
+      val proj = UnsafeProjection.create(schema)
+      proj.initialize(index)
+      iter.map { r =>
+        numOutputRows += 1
+        proj(r)
+      }
+    }
   }
 
-  override def sameResult(plan: LogicalPlan) = plan match {
-    case SparkLogicalPlan(ExistingRdd(_, rdd)) =>
-      rdd.id == alreadyPlanned.asInstanceOf[ExistingRdd].rdd.id
-    case _ => false
+  override def simpleString: String = {
+    s"$nodeName${truncatedString(output, "[", ",", "]")}"
   }
 
-  @transient override lazy val statistics = Statistics(
-    // TODO: Instead of returning a default value here, find a way to return a meaningful size
-    // estimate for RDDs. See PR 1238 for more discussions.
-    sizeInBytes = BigInt(sqlContext.defaultSizeInBytes)
-  )
+  // Input can be InternalRow, has to be turned into UnsafeRows.
+  override protected val createUnsafeProjection: Boolean = true
+
+  override def inputRDD: RDD[InternalRow] = rdd
 }

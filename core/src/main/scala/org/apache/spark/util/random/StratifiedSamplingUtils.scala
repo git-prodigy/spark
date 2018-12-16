@@ -22,11 +22,9 @@ import scala.collection.mutable
 import scala.collection.mutable.ArrayBuffer
 import scala.reflect.ClassTag
 
-import cern.jet.random.Poisson
-import cern.jet.random.engine.DRand
+import org.apache.commons.math3.distribution.PoissonDistribution
 
-import org.apache.spark.Logging
-import org.apache.spark.SparkContext._
+import org.apache.spark.internal.Logging
 import org.apache.spark.rdd.RDD
 
 /**
@@ -37,13 +35,14 @@ import org.apache.spark.rdd.RDD
  * high probability. This is achieved by maintaining a waitlist of size O(log(s)), where s is the
  * desired sample size for each stratum.
  *
- * Like in simple random sampling, we generate a random value for each item from the
- * uniform  distribution [0.0, 1.0]. All items with values <= min(values of items in the waitlist)
- * are accepted into the sample instantly. The threshold for instant accept is designed so that
- * s - numAccepted = O(sqrt(s)), where s is again the desired sample size. Thus, by maintaining a
- * waitlist size = O(sqrt(s)), we will be able to create a sample of the exact size s by adding
- * a portion of the waitlist to the set of items that are instantly accepted. The exact threshold
- * is computed by sorting the values in the waitlist and picking the value at (s - numAccepted).
+ * Like in simple random sampling, we generate a random value for each item from the uniform
+ * distribution [0.0, 1.0]. All items with values less than or equal to min(values of items in the
+ * waitlist) are accepted into the sample instantly. The threshold for instant accept is designed
+ * so that s - numAccepted = O(sqrt(s)), where s is again the desired sample size. Thus, by
+ * maintaining a waitlist size = O(sqrt(s)), we will be able to create a sample of the exact size
+ * s by adding a portion of the waitlist to the set of items that are instantly accepted. The exact
+ * threshold is computed by sorting the values in the waitlist and picking the value at
+ * (s - numAccepted).
  *
  * Note that since we use the same seed for the RNG when computing the thresholds and the actual
  * sample, our computed thresholds are guaranteed to produce the desired sample size.
@@ -162,12 +161,20 @@ private[spark] object StratifiedSamplingUtils extends Logging {
    *
    * To do so, we compute sampleSize = math.ceil(size * samplingRate) for each stratum and compare
    * it to the number of items that were accepted instantly and the number of items in the waitlist
-   * for that stratum. Most of the time, numAccepted <= sampleSize <= (numAccepted + numWaitlisted),
+   * for that stratum.
+   *
+   * Most of the time,
+   * {{{
+   * numAccepted <= sampleSize <= (numAccepted + numWaitlisted)
+   * }}}
    * which means we need to sort the elements in the waitlist by their associated values in order
-   * to find the value T s.t. |{elements in the stratum whose associated values <= T}| = sampleSize.
-   * Note that all elements in the waitlist have values >= bound for instant accept, so a T value
-   * in the waitlist range would allow all elements that were instantly accepted on the first pass
-   * to be included in the sample.
+   * to find the value T s.t.
+   * {{{
+   * |{elements in the stratum whose associated values <= T}| = sampleSize
+   * }}}.
+   * Note that all elements in the waitlist have values greater than or equal to bound for instant
+   * accept, so a T value in the waitlist range would allow all elements that were instantly
+   * accepted on the first pass to be included in the sample.
    */
   def computeThresholdByKey[K](finalResult: Map[K, AcceptanceResult],
       fractions: Map[K, Double]): Map[K, Double] = {
@@ -198,7 +205,7 @@ private[spark] object StratifiedSamplingUtils extends Logging {
    *
    * The sampling function has a unique seed per partition.
    */
-  def getBernoulliSamplingFunction[K, V](rdd: RDD[(K,  V)],
+  def getBernoulliSamplingFunction[K, V](rdd: RDD[(K, V)],
       fractions: Map[K, Double],
       exact: Boolean,
       seed: Long): (Int, Iterator[(K, V)]) => Iterator[(K, V)] = {
@@ -209,7 +216,7 @@ private[spark] object StratifiedSamplingUtils extends Logging {
       samplingRateByKey = computeThresholdByKey(finalResult, fractions)
     }
     (idx: Int, iter: Iterator[(K, V)]) => {
-      val rng = new RandomDataGenerator
+      val rng = new RandomDataGenerator()
       rng.reSeed(seed + idx)
       // Must use the same invoke pattern on the rng as in getSeqOp for without replacement
       // in order to generate the same sequence of random numbers when creating the sample
@@ -245,9 +252,9 @@ private[spark] object StratifiedSamplingUtils extends Logging {
           // Must use the same invoke pattern on the rng as in getSeqOp for with replacement
           // in order to generate the same sequence of random numbers when creating the sample
           val copiesAccepted = if (acceptBound == 0) 0L else rng.nextPoisson(acceptBound)
-          val copiesWailisted = rng.nextPoisson(finalResult(key).waitListBound)
+          val copiesWaitlisted = rng.nextPoisson(finalResult(key).waitListBound)
           val copiesInSample = copiesAccepted +
-            (0 until copiesWailisted).count(i => rng.nextUniform() < thresholdByKey(key))
+            (0 until copiesWaitlisted).count(i => rng.nextUniform() < thresholdByKey(key))
           if (copiesInSample > 0) {
             Iterator.fill(copiesInSample.toInt)(item)
           } else {
@@ -261,10 +268,10 @@ private[spark] object StratifiedSamplingUtils extends Logging {
         rng.reSeed(seed + idx)
         iter.flatMap { item =>
           val count = rng.nextPoisson(fractions(item._1))
-          if (count > 0) {
-            Iterator.fill(count)(item)
-          } else {
+          if (count == 0) {
             Iterator.empty
+          } else {
+            Iterator.fill(count)(item)
           }
         }
       }
@@ -274,15 +281,24 @@ private[spark] object StratifiedSamplingUtils extends Logging {
   /** A random data generator that generates both uniform values and Poisson values. */
   private class RandomDataGenerator {
     val uniform = new XORShiftRandom()
-    var poisson = new Poisson(1.0, new DRand)
+    // commons-math3 doesn't have a method to generate Poisson from an arbitrary mean;
+    // maintain a cache of Poisson(m) distributions for various m
+    val poissonCache = mutable.Map[Double, PoissonDistribution]()
+    var poissonSeed = 0L
 
-    def reSeed(seed: Long) {
+    def reSeed(seed: Long): Unit = {
       uniform.setSeed(seed)
-      poisson = new Poisson(1.0, new DRand(seed.toInt))
+      poissonSeed = seed
+      poissonCache.clear()
     }
 
     def nextPoisson(mean: Double): Int = {
-      poisson.nextInt(mean)
+      val poisson = poissonCache.getOrElseUpdate(mean, {
+        val newPoisson = new PoissonDistribution(mean)
+        newPoisson.reseedRandomGenerator(poissonSeed)
+        newPoisson
+      })
+      poisson.sample()
     }
 
     def nextUniform(): Double = {
@@ -304,7 +320,7 @@ private[random] class AcceptanceResult(var numItems: Long = 0L, var numAccepted:
   var acceptBound: Double = Double.NaN // upper bound for accepting item instantly
   var waitListBound: Double = Double.NaN // upper bound for adding item to waitlist
 
-  def areBoundsEmpty = acceptBound.isNaN || waitListBound.isNaN
+  def areBoundsEmpty: Boolean = acceptBound.isNaN || waitListBound.isNaN
 
   def merge(other: Option[AcceptanceResult]): Unit = {
     if (other.isDefined) {

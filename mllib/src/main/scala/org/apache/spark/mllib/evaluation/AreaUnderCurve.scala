@@ -17,8 +17,8 @@
 
 package org.apache.spark.mllib.evaluation
 
-import org.apache.spark.rdd.RDD
 import org.apache.spark.mllib.rdd.RDDFunctions._
+import org.apache.spark.rdd.RDD
 
 /**
  * Computes the area under the curve (AUC) using the trapezoidal rule.
@@ -39,11 +39,11 @@ private[evaluation] object AreaUnderCurve {
   /**
    * Returns the area under the given curve.
    *
-   * @param curve a RDD of ordered 2D points stored in pairs representing a curve
+   * @param curve an RDD of ordered 2D points stored in pairs representing a curve
    */
   def of(curve: RDD[(Double, Double)]): Double = {
     curve.sliding(2).aggregate(0.0)(
-      seqOp = (auc: Double, points: Seq[(Double, Double)]) => auc + trapezoid(points),
+      seqOp = (auc: Double, points: Array[(Double, Double)]) => auc + trapezoid(points),
       combOp = _ + _
     )
   }

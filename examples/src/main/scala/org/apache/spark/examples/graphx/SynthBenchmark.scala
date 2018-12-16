@@ -15,13 +15,14 @@
  * limitations under the License.
  */
 
+// scalastyle:off println
 package org.apache.spark.examples.graphx
 
-import org.apache.spark.SparkContext._
-import org.apache.spark.graphx.PartitionStrategy
-import org.apache.spark.{SparkContext, SparkConf}
+import java.io.{FileOutputStream, PrintWriter}
+
+import org.apache.spark.{SparkConf, SparkContext}
+import org.apache.spark.graphx.{GraphXUtils, PartitionStrategy}
 import org.apache.spark.graphx.util.GraphGenerators
-import java.io.{PrintWriter, FileOutputStream}
 
 /**
  * The SynthBenchmark application can be used to run various GraphX algorithms on
@@ -51,7 +52,7 @@ object SynthBenchmark {
       arg =>
         arg.dropWhile(_ == '-').split('=') match {
           case Array(opt, v) => (opt -> v)
-          case _ => throw new IllegalArgumentException("Invalid argument: " + arg)
+          case _ => throw new IllegalArgumentException(s"Invalid argument: $arg")
         }
     }
 
@@ -67,7 +68,7 @@ object SynthBenchmark {
 
     options.foreach {
       case ("app", v) => app = v
-      case ("niter", v) => niter = v.toInt
+      case ("niters", v) => niter = v.toInt
       case ("nverts", v) => numVertices = v.toInt
       case ("numEPart", v) => numEPart = Some(v.toInt)
       case ("partStrategy", v) => partitionStrategy = Some(PartitionStrategy.fromString(v))
@@ -75,18 +76,17 @@ object SynthBenchmark {
       case ("sigma", v) => sigma = v.toDouble
       case ("degFile", v) => degFile = v
       case ("seed", v) => seed = v.toInt
-      case (opt, _) => throw new IllegalArgumentException("Invalid option: " + opt)
+      case (opt, _) => throw new IllegalArgumentException(s"Invalid option: $opt")
     }
 
     val conf = new SparkConf()
       .setAppName(s"GraphX Synth Benchmark (nverts = $numVertices, app = $app)")
-      .set("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
-      .set("spark.kryo.registrator", "org.apache.spark.graphx.GraphKryoRegistrator")
+    GraphXUtils.registerKryoClasses(conf)
 
     val sc = new SparkContext(conf)
 
     // Create the graph
-    println(s"Creating graph...")
+    println("Creating graph...")
     val unpartitionedGraph = GraphGenerators.logNormalGraph(sc, numVertices,
       numEPart.getOrElse(sc.defaultParallelism), mu, sigma, seed)
     // Repartition the graph
@@ -129,3 +129,4 @@ object SynthBenchmark {
     sc.stop()
   }
 }
+// scalastyle:on println

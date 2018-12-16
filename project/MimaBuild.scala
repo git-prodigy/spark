@@ -22,7 +22,7 @@ import com.typesafe.tools.mima.core._
 import com.typesafe.tools.mima.core.MissingClassProblem
 import com.typesafe.tools.mima.core.MissingTypesProblem
 import com.typesafe.tools.mima.core.ProblemFilters._
-import com.typesafe.tools.mima.plugin.MimaKeys.{binaryIssueFilters, previousArtifact}
+import com.typesafe.tools.mima.plugin.MimaKeys.{mimaBinaryIssueFilters, mimaPreviousArtifacts}
 import com.typesafe.tools.mima.plugin.MimaPlugin.mimaDefaultSettings
 
 
@@ -30,9 +30,9 @@ object MimaBuild {
 
   def excludeMember(fullName: String) = Seq(
       ProblemFilters.exclude[MissingMethodProblem](fullName),
-      // Sometimes excluded methods have default arguments and 
+      // Sometimes excluded methods have default arguments and
       // they are translated into public methods/fields($default$) in generated
-      // bytecode. It is not possible to exhustively list everything.
+      // bytecode. It is not possible to exhaustively list everything.
       // But this should be okay.
       ProblemFilters.exclude[MissingMethodProblem](fullName+"$default$2"),
       ProblemFilters.exclude[MissingMethodProblem](fullName+"$default$1"),
@@ -42,14 +42,11 @@ object MimaBuild {
       ProblemFilters.exclude[IncompatibleFieldTypeProblem](fullName)
     )
 
-  // Exclude a single class and its corresponding object
+  // Exclude a single class
   def excludeClass(className: String) = Seq(
-      excludePackage(className),
+      ProblemFilters.exclude[Problem](className + ".*"),
       ProblemFilters.exclude[MissingClassProblem](className),
-      ProblemFilters.exclude[MissingTypesProblem](className),
-      excludePackage(className + "$"),
-      ProblemFilters.exclude[MissingClassProblem](className + "$"),
-      ProblemFilters.exclude[MissingTypesProblem](className + "$")
+      ProblemFilters.exclude[MissingTypesProblem](className)
     )
 
   // Exclude a Spark class, that is in the package org.apache.spark
@@ -59,7 +56,7 @@ object MimaBuild {
 
   // Exclude a Spark package, that is in the package org.apache.spark
   def excludeSparkPackage(packageName: String) = {
-    excludePackage("org.apache.spark." + packageName)
+    ProblemFilters.exclude[Problem]("org.apache.spark." + packageName + ".*")
   }
 
   def ignoredABIProblems(base: File, currentSparkVersion: String) = {
@@ -91,11 +88,12 @@ object MimaBuild {
 
   def mimaSettings(sparkHome: File, projectRef: ProjectRef) = {
     val organization = "org.apache.spark"
-    val previousSparkVersion = "1.1.0"
-    val fullId = "spark-" + projectRef.project + "_2.10"
-    mimaDefaultSettings ++ 
-    Seq(previousArtifact := Some(organization % fullId % previousSparkVersion),
-      binaryIssueFilters ++= ignoredABIProblems(sparkHome, version.value))
+    val previousSparkVersion = "2.4.0"
+    val project = projectRef.project
+    val fullId = "spark-" + project + "_2.12"
+    mimaDefaultSettings ++
+    Seq(mimaPreviousArtifacts := Set(organization % fullId % previousSparkVersion),
+      mimaBinaryIssueFilters ++= ignoredABIProblems(sparkHome, version.value))
   }
 
 }

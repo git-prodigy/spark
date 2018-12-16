@@ -15,20 +15,21 @@
  * limitations under the License.
  */
 
+// scalastyle:off println
 package org.apache.spark.examples
 
 import java.util.Random
 
-import breeze.linalg.{Vector, DenseVector}
+import breeze.linalg.{DenseVector, Vector}
 
 /**
  * Logistic regression based classification.
  *
  * This is an example implementation for learning how to use Spark. For more conventional use,
- * please refer to org.apache.spark.mllib.classification.LogisticRegression
+ * please refer to org.apache.spark.ml.classification.LogisticRegression.
  */
 object LocalFileLR {
-  val D = 10   // Numer of dimensions
+  val D = 10   // Number of dimensions
   val rand = new Random(42)
 
   case class DataPoint(x: Vector[Double], y: Double)
@@ -41,7 +42,7 @@ object LocalFileLR {
   def showWarning() {
     System.err.println(
       """WARN: This is a naive implementation of Logistic Regression and is given as an example!
-        |Please use the LogisticRegression method found in org.apache.spark.mllib.classification
+        |Please use org.apache.spark.ml.classification.LogisticRegression
         |for more conventional use.
       """.stripMargin)
   }
@@ -50,17 +51,18 @@ object LocalFileLR {
 
     showWarning()
 
-    val lines = scala.io.Source.fromFile(args(0)).getLines().toArray
-    val points = lines.map(parsePoint _)
+    val fileSrc = scala.io.Source.fromFile(args(0))
+    val lines = fileSrc.getLines().toArray
+    val points = lines.map(parsePoint)
     val ITERATIONS = args(1).toInt
 
     // Initialize w to a random value
-    var w = DenseVector.fill(D){2 * rand.nextDouble - 1}
-    println("Initial w: " + w)
+    val w = DenseVector.fill(D) {2 * rand.nextDouble - 1}
+    println(s"Initial w: $w")
 
     for (i <- 1 to ITERATIONS) {
-      println("On iteration " + i)
-      var gradient = DenseVector.zeros[Double](D)
+      println(s"On iteration $i")
+      val gradient = DenseVector.zeros[Double](D)
       for (p <- points) {
         val scale = (1 / (1 + math.exp(-p.y * (w.dot(p.x)))) - 1) * p.y
         gradient += p.x * scale
@@ -68,6 +70,8 @@ object LocalFileLR {
       w -= gradient
     }
 
-    println("Final w: " + w)
+    fileSrc.close()
+    println(s"Final w: $w")
   }
 }
+// scalastyle:on println

@@ -17,74 +17,131 @@
 
 package org.apache.spark.scheduler
 
-import java.io.{BufferedInputStream, InputStream}
+import java.io.{EOFException, InputStream, IOException}
 
 import scala.io.Source
 
-import org.apache.hadoop.fs.{Path, FileSystem}
+import com.fasterxml.jackson.core.JsonParseException
+import com.fasterxml.jackson.databind.exc.UnrecognizedPropertyException
 import org.json4s.jackson.JsonMethods._
 
-import org.apache.spark.Logging
-import org.apache.spark.io.CompressionCodec
+import org.apache.spark.internal.Logging
+import org.apache.spark.scheduler.ReplayListenerBus._
 import org.apache.spark.util.JsonProtocol
 
 /**
- * A SparkListenerBus that replays logged events from persisted storage.
- *
- * This assumes the given paths are valid log files, where each line can be deserialized into
- * exactly one SparkListenerEvent.
+ * A SparkListenerBus that can be used to replay events from serialized event data.
  */
-private[spark] class ReplayListenerBus(
-    logPaths: Seq[Path],
-    fileSystem: FileSystem,
-    compressionCodec: Option[CompressionCodec])
-  extends SparkListenerBus with Logging {
+private[spark] class ReplayListenerBus extends SparkListenerBus with Logging {
 
-  private var replayed = false
-
-  if (logPaths.length == 0) {
-    logWarning("Log path provided contains no log files.")
+  /**
+   * Replay each event in the order maintained in the given stream. The stream is expected to
+   * contain one JSON-encoded SparkListenerEvent per line.
+   *
+   * This method can be called multiple times, but the listener behavior is undefined after any
+   * error is thrown by this method.
+   *
+   * @param logData Stream containing event log data.
+   * @param sourceName Filename (or other source identifier) from whence @logData is being read
+   * @param maybeTruncated Indicate whether log file might be truncated (some abnormal situations
+   *        encountered, log file might not finished writing) or not
+   * @param eventsFilter Filter function to select JSON event strings in the log data stream that
+   *        should be parsed and replayed. When not specified, all event strings in the log data
+   *        are parsed and replayed.
+   */
+  def replay(
+      logData: InputStream,
+      sourceName: String,
+      maybeTruncated: Boolean = false,
+      eventsFilter: ReplayEventsFilter = SELECT_ALL_FILTER): Unit = {
+    val lines = Source.fromInputStream(logData).getLines()
+    replay(lines, sourceName, maybeTruncated, eventsFilter)
   }
 
   /**
-   * Replay each event in the order maintained in the given logs.
-   * This should only be called exactly once.
+   * Overloaded variant of [[replay()]] which accepts an iterator of lines instead of an
+   * [[InputStream]]. Exposed for use by custom ApplicationHistoryProvider implementations.
    */
-  def replay() {
-    assert(!replayed, "ReplayListenerBus cannot replay events more than once")
-    logPaths.foreach { path =>
-      // Keep track of input streams at all levels to close them later
-      // This is necessary because an exception can occur in between stream initializations
-      var fileStream: Option[InputStream] = None
-      var bufferedStream: Option[InputStream] = None
-      var compressStream: Option[InputStream] = None
-      var currentLine = "<not started>"
-      try {
-        fileStream = Some(fileSystem.open(path))
-        bufferedStream = Some(new BufferedInputStream(fileStream.get))
-        compressStream = Some(wrapForCompression(bufferedStream.get))
+  def replay(
+      lines: Iterator[String],
+      sourceName: String,
+      maybeTruncated: Boolean,
+      eventsFilter: ReplayEventsFilter): Unit = {
+    var currentLine: String = null
+    var lineNumber: Int = 0
+    val unrecognizedEvents = new scala.collection.mutable.HashSet[String]
+    val unrecognizedProperties = new scala.collection.mutable.HashSet[String]
 
-        // Parse each line as an event and post the event to all attached listeners
-        val lines = Source.fromInputStream(compressStream.get).getLines()
-        lines.foreach { line =>
-          currentLine = line
-          postToAll(JsonProtocol.sparkEventFromJson(parse(line)))
+    try {
+      val lineEntries = lines
+        .zipWithIndex
+        .filter { case (line, _) => eventsFilter(line) }
+
+      while (lineEntries.hasNext) {
+        try {
+          val entry = lineEntries.next()
+
+          currentLine = entry._1
+          lineNumber = entry._2 + 1
+
+          postToAll(JsonProtocol.sparkEventFromJson(parse(currentLine)))
+        } catch {
+          case e: ClassNotFoundException =>
+            // Ignore unknown events, parse through the event log file.
+            // To avoid spamming, warnings are only displayed once for each unknown event.
+            if (!unrecognizedEvents.contains(e.getMessage)) {
+              logWarning(s"Drop unrecognized event: ${e.getMessage}")
+              unrecognizedEvents.add(e.getMessage)
+            }
+            logDebug(s"Drop incompatible event log: $currentLine")
+          case e: UnrecognizedPropertyException =>
+            // Ignore unrecognized properties, parse through the event log file.
+            // To avoid spamming, warnings are only displayed once for each unrecognized property.
+            if (!unrecognizedProperties.contains(e.getMessage)) {
+              logWarning(s"Drop unrecognized property: ${e.getMessage}")
+              unrecognizedProperties.add(e.getMessage)
+            }
+            logDebug(s"Drop incompatible event log: $currentLine")
+          case jpe: JsonParseException =>
+            // We can only ignore exception from last line of the file that might be truncated
+            // the last entry may not be the very last line in the event log, but we treat it
+            // as such in a best effort to replay the given input
+            if (!maybeTruncated || lineEntries.hasNext) {
+              throw jpe
+            } else {
+              logWarning(s"Got JsonParseException from log file $sourceName" +
+                s" at line $lineNumber, the file might not have finished writing cleanly.")
+            }
         }
-      } catch {
-        case e: Exception =>
-          logError("Exception in parsing Spark event log %s".format(path), e)
-          logError("Malformed line: %s\n".format(currentLine))
-      } finally {
-        fileStream.foreach(_.close())
-        bufferedStream.foreach(_.close())
-        compressStream.foreach(_.close())
       }
+    } catch {
+      case e: HaltReplayException =>
+        // Just stop replay.
+      case _: EOFException if maybeTruncated =>
+      case ioe: IOException =>
+        throw ioe
+      case e: Exception =>
+        logError(s"Exception parsing Spark event log: $sourceName", e)
+        logError(s"Malformed line #$lineNumber: $currentLine\n")
     }
-    replayed = true
   }
 
-  /** If a compression codec is specified, wrap the given stream in a compression stream. */
-  private def wrapForCompression(stream: InputStream): InputStream = {
-    compressionCodec.map(_.compressedInputStream(stream)).getOrElse(stream)
+  override protected def isIgnorableException(e: Throwable): Boolean = {
+    e.isInstanceOf[HaltReplayException]
   }
+
+}
+
+/**
+ * Exception that can be thrown by listeners to halt replay. This is handled by ReplayListenerBus
+ * only, and will cause errors if thrown when using other bus implementations.
+ */
+private[spark] class HaltReplayException extends RuntimeException
+
+private[spark] object ReplayListenerBus {
+
+  type ReplayEventsFilter = (String) => Boolean
+
+  // utility filter that selects all event logs during replay
+  val SELECT_ALL_FILTER: ReplayEventsFilter = { (eventString: String) => true }
 }
